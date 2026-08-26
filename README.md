@@ -80,6 +80,6 @@ php artisan tinker
 
 ## 7. Suite
 
-- Sprint 3 : back-office Filament (CRUD héros + modération des contributions)
+- Sprint 3 :  Back-office (Laravel (React + Inertia) )
 - Sprint 4 : front public (liste, filtres, fiche héros)
 - Sprint 5 : Scout + Meilisearch, puis recherche sémantique sur `hero_chunks`
