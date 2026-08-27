@@ -1,88 +1,188 @@
-# MoroccoHeroes — base de données
+# MoroccoHeroes
 
-Sprint 2 : migrations, models Eloquent et seeders.
+Moteur de recherche sur les figures marocaines — sport, culture, histoire, savoir.
+Projet de stage · Ministère de la Culture et des Sports.
 
-## 1. Créer le projet
+**Stack :** Laravel 13 · Inertia · React · Tailwind · SQLite
+**Langues :** Français · العربية · ⵜⴰⵎⴰⵣⵉⵖⵜ · English
 
-```bash
-laravel new moroccoheroes --react   # Laravel + Inertia + React + Tailwind
-cd moroccoheroes
+---
+
+## 1. Principe
+
+L'utilisateur n'est pas limité à un catalogue pré-rempli : il peut chercher
+n'importe quelle figure marocaine. Le site fonctionne en **cache-first**.
+
+```
+Requête
+  │
+  ├─ Fiche déjà en base ?  ──oui──▶  affichage immédiat (~20 ms)
+  │
+  └─ non
+       ├─ recherche web (Tavily)
+       ├─ récupération des pages en parallèle (Http::pool)
+       ├─ structuration par LLM (Gemini) → fiche JSON
+       ├─ enregistrement en base, statut « brouillon »
+       └─ affichage avec mention « générée automatiquement, non vérifiée »
 ```
 
-Dans Laravel Herd : `herd link` depuis le dossier du projet, le site est servi sur `http://moroccoheroes.test`.
+La base se remplit donc à l'usage. Une même recherche ne coûte un appel externe
+qu'une seule fois ; ensuite elle est servie localement, en quatre langues.
 
-## 2. Base de données
+Les fiches issues de la génération automatique portent `is_ai_generated = true`
+et restent en brouillon jusqu'à relecture par un modérateur. Chaque fiche cite
+les sources d'où elle provient.
 
-SQLite en développement : un seul fichier, zéro configuration. Dans `.env` :
+---
+
+## 2. Installation
+
+Prérequis : PHP 8.4 (via [Laravel Herd](https://herd.laravel.com)), Node 20+, Composer.
+
+```bash
+git clone https://github.com/<ORGANISATION>/moroccoheroes.git
+cd moroccoheroes
+
+composer install
+npm install
+
+cp .env.example .env
+php artisan key:generate
+
+touch database/database.sqlite
+php artisan migrate --seed
+
+herd link
+npm run dev
+```
+
+Le site est servi sur `http://moroccoheroes.test`.
+
+> `herd link` agit sur le dossier courant ; l'argument optionnel change le
+> sous-domaine, pas le chemin.
+
+### Configuration
 
 ```env
 DB_CONNECTION=sqlite
 
 APP_LOCALE=fr
 APP_FALLBACK_LOCALE=fr
+
+TAVILY_API_KEY=
+GEMINI_API_KEY=
 ```
 
-```bash
-touch database/database.sqlite
-php artisan migrate --seed
-```
+Les deux services ont un palier gratuit suffisant pour le développement
+(Tavily : 1 000 requêtes/mois ; Gemini : quota quotidien gratuit).
 
-Les migrations sont écrites avec le Schema Builder de Laravel et fonctionnent sur SQLite, MySQL et PostgreSQL sans modification. La migration `101700_add_vector_column` se saute d'elle-même hors PostgreSQL.
+SQLite en développement : un seul fichier, zéro configuration. Les migrations
+sont écrites avec le Schema Builder et fonctionnent aussi sur MySQL et
+PostgreSQL sans modification.
 
-## 3. Copier les fichiers
+---
 
-```
-database/migrations/*   →  database/migrations/
-database/seeders/*      →  database/seeders/
-app/Models/*            →  app/Models/
-app/Concerns/*          →  app/Concerns/
-```
+## 3. Le multilingue
 
-Le fichier `app/Concerns/HasTranslations.php` est un trait maison — pas besoin de package externe.
+Le texte ne vit pas dans les tables principales mais dans des tables de
+traduction dédiées (`hero_translations`, `category_translations`), une ligne par
+langue.
 
-## 4. Dépendances
+Une colonne JSON `{"ar": "…", "fr": "…"}` aurait été plus rapide à écrire, mais
+elle interdit de trier ou d'indexer par langue, et chaque langue ajoutée devient
+une migration. Avec une table séparée, ajouter le tamazight n'a demandé que des
+lignes supplémentaires dans le seeder.
 
-```bash
-composer require laravel/scout
-php artisan migrate --seed
-```
+Le trait `app/Concerns/HasTranslations.php` fournit `tr('champ')` avec un
+**fallback champ par champ** : si la fiche amazighe existe mais que sa
+biographie est vide, la biographie française s'affiche plutôt qu'un blanc. C'est
+ce qui permet de publier des traductions partielles sans casser le site.
 
-Vérifier ensuite :
+Les langues sont déclarées dans `config/locales.php`. Le middleware `SetLocale`
+lit la langue en session et passe **avant** `HandleInertiaRequests`, qui la
+partage avec React.
 
-```bash
-php artisan tinker
->>> App\Models\Hero::published()->withTranslation('ar')->get()->map->tr('name');
-```
+Le tamazight s'écrit en tifinagh (`zgh`), de gauche à droite, avec la police
+*Noto Sans Tifinagh*. Les traductions amazighes sont en cours de validation
+terminologique.
 
-## 5. Structure
+---
+
+## 4. Schéma de données
 
 | Table | Rôle |
 |---|---|
 | `categories` + `category_translations` | arbre à 2 niveaux (Sport → Football) |
-| `heroes` | données non traduisibles : dates, statut, compteurs |
+| `heroes` | données non traduisibles : dates, statut, provenance, compteurs |
 | `hero_translations` | tout le texte, une ligne par langue |
 | `achievements` | palmarès (titres, records, œuvres) |
 | `timeline_events` | frise chronologique |
 | `media` / `sources` | images et références, avec licence et fiabilité |
 | `tags` + `hero_tag` | étiquettes transversales |
 | `hero_relations` | mentor, rival, coéquipier, famille |
-| `hero_submissions` | contributions du public en attente de modération |
-| `hero_chunks` | fragments indexés pour le RAG |
-| `chat_sessions` / `chat_messages` | conversations avec l'agent IA, avec citations |
+| `hero_submissions` | fiches en attente de modération |
+| `hero_chunks` | fragments indexés pour la recherche sémantique |
+| `chat_sessions` / `chat_messages` | conversations avec l'agent, avec citations |
 | `favorites` | héros mis de côté par un utilisateur |
 
-## 6. Trois choix à connaître pour la soutenance
+---
 
-**Traductions en table séparée, pas en JSON.** Une colonne JSON `{"ar": "...", "fr": "..."}` est plus rapide à écrire, mais impossible à trier ou indexer par langue, et chaque langue ajoutée devient une migration. Avec `hero_translations`, ajouter le tamazight n'a demandé que des lignes supplémentaires dans le seeder.
+## 5. Garde-fous
 
-**Quatre langues, dont le tamazight en Tifinagh** (`zgh`, de gauche à droite, police *Noto Sans Tifinagh*). Le fallback se fait **champ par champ** : si la fiche amazighe existe mais que sa biographie est vide, la biographie française s'affiche plutôt qu'un blanc. C'est ce qui permet de publier des traductions partielles sans casser le site. Les traductions amazighes sont en cours de validation terminologique.
+Une fiche générée automatiquement n'est jamais publiée telle quelle : elle est
+créée en brouillon, signalée comme non vérifiée à l'affichage, et doit être
+relue avant d'être publiée. Chaque fiche cite ses sources.
 
-**Le chat IA est désactivé par défaut** (`ai_chat_enabled = false`). Un modérateur l'active fiche par fiche, et seulement si les sources sont vérifiées. Pour une personne vivante, `ai_chat_mode` reste `biographical` : l'agent parle *de* la personne, il ne se fait pas passer *pour* elle. La règle est portée par le schéma, pas seulement par le prompt.
+L'agent conversationnel est désactivé par défaut (`ai_chat_enabled = false`) et
+s'active fiche par fiche. Pour une personne vivante, `ai_chat_mode` reste
+`biographical` : l'agent parle *de* la personne, il ne se fait pas passer *pour*
+elle. La règle est portée par le schéma, pas seulement par le prompt.
 
-## 7. Suite
+---
 
-- Sprint 3 : back-office (Laravel + React + Inertia)
-- Sprint 4 : front public (liste, filtres, fiche héros)
-- Sprint 5 : service Python — recherche hybride (BM25 + embeddings)
-- Sprint 6 : agent conversationnel sourcé
-- Déploiement : Laravel Forge
+## 6. Feuille de route
+
+- [x] **Sprint 1** — Schéma de données, models, seeders, socle multilingue
+- [x] **Sprint 2** — Configuration multilingue, tamazight, switcher de langue
+- [ ] **Sprint 3** — Moteur de recherche : web search, extraction LLM, persistance
+- [ ] **Sprint 4** — Front public : recherche, fiche héros, i18n de l'interface, RTL
+- [ ] **Sprint 5** — Déploiement (Laravel Forge) et intégration continue
+- [ ] **Sprint 6** — Recherche sémantique sur le corpus accumulé
+- [ ] **Sprint 7** — Modération des fiches générées
+- [ ] **Sprint 8** — Agent conversationnel sourcé, documentation
+
+---
+
+## 7. Commandes utiles
+
+```bash
+php artisan migrate:fresh --seed
+php artisan db:seed --class=CategorySeeder
+php artisan tinker
+npm run dev
+npm run build
+```
+
+Vérifier le multilingue :
+
+```php
+$c = App\Models\Category::where('slug','sport')->with('translations')->first();
+app()->setLocale('zgh');
+$c->tr('name');   // ⴰⴷⴷⴰⵍ
+```
+
+---
+
+## 8. Structure
+
+```
+app/
+  Concerns/HasTranslations.php    trait de traduction
+  Http/Middleware/SetLocale.php   résolution de la langue
+  Models/                         Hero, Category, Achievement, …
+  Services/                       recherche web, extraction, orchestration
+config/locales.php                langues supportées
+database/migrations/              migrations métier
+database/seeders/                 catégories et fiches de démonstration
+resources/js/                     application React (Inertia)
+```
