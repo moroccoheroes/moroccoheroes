@@ -10,28 +10,44 @@ Projet de stage · Ministère de la Culture et des Sports.
 
 ## 1. Principe
 
-L'utilisateur n'est pas limité à un catalogue pré-rempli : il peut chercher
-n'importe quelle figure marocaine. Le site fonctionne en **cache-first**.
+L'utilisateur cherche **dans la base locale**. Il ne voit que des fiches relues
+et publiées, servies en quatre langues.
+
+Quand une recherche ne trouve rien, elle n'appelle aucun service externe : elle
+est **enregistrée comme demande** et remonte à l'administrateur. Celui-ci lance
+la recherche documentaire depuis son espace, relit la fiche produite, puis la
+publie.
 
 ```
-Requête
-  │
-  ├─ Fiche déjà en base ?  ──oui──▶  affichage immédiat (~20 ms)
-  │
-  └─ non
-       ├─ recherche web (Tavily)
-       ├─ récupération des pages en parallèle (Http::pool)
-       ├─ structuration par LLM (Gemini) → fiche JSON
-       ├─ enregistrement en base, statut « brouillon »
-       └─ affichage avec mention « générée automatiquement, non vérifiée »
+Utilisateur
+    │
+    ▼
+Recherche en base ──── trouvé ──▶ fiche publiée (~20 ms, 4 langues)
+    │
+ rien trouvé
+    │
+    ▼
+Événement HeroNotFound ──▶ table search_requests
+                                    │
+                                    ▼
+                        Espace administrateur
+                                    │
+                    php artisan hero:search "…"
+                                    │
+                    recherche web → extraction → brouillon
+                                    │
+                              relecture
+                                    │
+                                    ▼
+                             fiche publiée
 ```
 
-La base se remplit donc à l'usage. Une même recherche ne coûte un appel externe
-qu'une seule fois ; ensuite elle est servie localement, en quatre langues.
+Les demandes identiques sont regroupées et comptées : l'administrateur traite
+en priorité ce que les visiteurs cherchent le plus.
 
-Les fiches issues de la génération automatique portent `is_ai_generated = true`
-et restent en brouillon jusqu'à relecture par un modérateur. Chaque fiche cite
-les sources d'où elle provient.
+Aucun contenu généré automatiquement n'est visible sans validation humaine. Une
+fiche publiée sur un site du Ministère engage l'institution : elle doit avoir
+été relue.
 
 ---
 
@@ -70,15 +86,18 @@ APP_LOCALE=fr
 APP_FALLBACK_LOCALE=fr
 
 TAVILY_API_KEY=
-GEMINI_API_KEY=
+GROQ_API_KEY=
 ```
 
-Les deux services ont un palier gratuit suffisant pour le développement
-(Tavily : 1 000 requêtes/mois ; Gemini : quota quotidien gratuit).
+Les deux services ont un palier gratuit suffisant pour le développement.
+
+Le fournisseur de modèle passe par le **Laravel AI SDK** : il se change dans la
+configuration, sans toucher au code applicatif. Ce choix vient d'un incident
+réel — un fournisseur ayant coupé l'accès en cours de développement, tout
+l'appel avait dû être réécrit. L'abstraction évite que cela se reproduise.
 
 SQLite en développement : un seul fichier, zéro configuration. Les migrations
-sont écrites avec le Schema Builder et fonctionnent aussi sur MySQL et
-PostgreSQL sans modification.
+utilisent le Schema Builder et fonctionnent aussi sur MySQL et PostgreSQL.
 
 ---
 
@@ -103,8 +122,10 @@ lit la langue en session et passe **avant** `HandleInertiaRequests`, qui la
 partage avec React.
 
 Le tamazight s'écrit en tifinagh (`zgh`), de gauche à droite, avec la police
-*Noto Sans Tifinagh*. Les traductions amazighes sont en cours de validation
-terminologique.
+*Noto Sans Tifinagh*. L'extraction automatique laisse volontairement les champs
+amazighs vides : la transcription des noms propres en tifinagh n'a pas de norme
+stable et ne doit pas être devinée par un modèle. Ces champs sont saisis
+manuellement après validation terminologique.
 
 ---
 
@@ -120,6 +141,7 @@ terminologique.
 | `media` / `sources` | images et références, avec licence et fiabilité |
 | `tags` + `hero_tag` | étiquettes transversales |
 | `hero_relations` | mentor, rival, coéquipier, famille |
+| `search_requests` | recherches sans résultat, regroupées et comptées |
 | `hero_submissions` | fiches en attente de modération |
 | `hero_chunks` | fragments indexés pour la recherche sémantique |
 | `chat_sessions` / `chat_messages` | conversations avec l'agent, avec citations |
@@ -127,35 +149,57 @@ terminologique.
 
 ---
 
-## 5. Garde-fous
+## 5. Le pipeline d'extraction
 
-Une fiche générée automatiquement n'est jamais publiée telle quelle : elle est
-créée en brouillon, signalée comme non vérifiée à l'affichage, et doit être
-relue avant d'être publiée. Chaque fiche cite ses sources.
+Lancé par l'administrateur via `php artisan hero:search "Nom"` :
+
+1. **Recherche web** — cinq résultats avec le contenu brut des pages.
+2. **Filtrage** — les pages vides sont écartées, les réseaux sociaux aussi : ce
+   ne sont pas des sources acceptables pour un site institutionnel.
+3. **Nettoyage** — suppression des images encodées, des liens, des sections de
+   références et de navigation, puis troncature. En pratique, cette étape fait
+   passer le contexte d'environ 100 000 à 13 000 caractères.
+4. **Extraction** — un agent produit une fiche structurée en JSON, avec
+   consigne stricte de ne rien inventer et de mettre `null` en cas de doute.
+5. **Persistance** — fiche, traductions, palmarès et sources, en brouillon.
+
+Une source propre vaut mieux qu'une source volumineuse : une fiche de
+fédération de 7 000 caractères donne un meilleur résultat qu'un article
+encyclopédique de 75 000, dont l'essentiel est constitué de tableaux et de
+références.
+
+---
+
+## 6. Garde-fous
+
+Aucune fiche générée n'est publiée telle quelle : brouillon, mention explicite
+à l'affichage, relecture obligatoire. Chaque fiche cite ses sources.
 
 L'agent conversationnel est désactivé par défaut (`ai_chat_enabled = false`) et
 s'active fiche par fiche. Pour une personne vivante, `ai_chat_mode` reste
 `biographical` : l'agent parle *de* la personne, il ne se fait pas passer *pour*
-elle. La règle est portée par le schéma, pas seulement par le prompt.
+elle. La règle est portée par le schéma, pas seulement par le prompt : une fiche
+non validée ne peut pas répondre, même si le prompt est contourné.
 
 ---
 
-## 6. Feuille de route
+## 7. Feuille de route
 
 - [x] **Sprint 1** — Schéma de données, models, seeders, socle multilingue
 - [x] **Sprint 2** — Configuration multilingue, tamazight, switcher de langue
-- [ ] **Sprint 3** — Moteur de recherche : web search, extraction LLM, persistance
-- [ ] **Sprint 4** — Front public : recherche, fiche héros, i18n de l'interface, RTL
-- [ ] **Sprint 5** — Déploiement (Laravel Forge) et intégration continue
-- [ ] **Sprint 6** — Recherche sémantique sur le corpus accumulé
-- [ ] **Sprint 7** — Modération des fiches générées
-- [ ] **Sprint 8** — Agent conversationnel sourcé, documentation
+- [ ] **Sprint 3** — Commande `hero:search` : recherche web, extraction, persistance
+- [ ] **Sprint 4** — Événement `HeroNotFound` et file des demandes
+- [ ] **Sprint 5** — Espace administrateur : demandes, brouillons, édition, publication
+- [ ] **Sprint 6** — Front public : recherche, fiche héros, i18n de l'interface, RTL
+- [ ] **Sprint 7** — Déploiement (Laravel Forge) et intégration continue
+- [ ] **Sprint 8** — Recherche sémantique et agent conversationnel sourcé
 
 ---
 
-## 7. Commandes utiles
+## 8. Commandes utiles
 
 ```bash
+php artisan hero:search "Nawal El Moutawakel"
 php artisan migrate:fresh --seed
 php artisan db:seed --class=CategorySeeder
 php artisan tinker
@@ -173,14 +217,17 @@ $c->tr('name');   // ⴰⴷⴷⴰⵍ
 
 ---
 
-## 8. Structure
+## 9. Structure
 
 ```
 app/
+  Ai/Agents/                      agents d'extraction (Laravel AI SDK)
   Concerns/HasTranslations.php    trait de traduction
+  Console/Commands/               hero:search
+  Events/ · Listeners/            HeroNotFound → file des demandes
   Http/Middleware/SetLocale.php   résolution de la langue
   Models/                         Hero, Category, Achievement, …
-  Services/                       recherche web, extraction, orchestration
+  Services/                       recherche web, nettoyage, orchestration
 config/locales.php                langues supportées
 database/migrations/              migrations métier
 database/seeders/                 catégories et fiches de démonstration
