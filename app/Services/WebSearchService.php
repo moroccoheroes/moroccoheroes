@@ -12,10 +12,14 @@ class WebSearchService
      * Ce ne sont pas des sources acceptables pour un site institutionnel.
      */
     private const BLOCKED = [
-        'instagram.com', 'facebook.com', 'x.com', 'twitter.com',
-        'tiktok.com', 'pinterest.com', 'linkedin.com',
-    ];
+    // reseaux sociaux
+    'instagram.com', 'facebook.com', 'x.com', 'twitter.com',
+    'tiktok.com', 'pinterest.com', 'linkedin.com',
 
+    // banques d'images : beaucoup de texte, aucune information
+    'gettyimages.com', 'shutterstock.com', 'alamy.com',
+    'istockphoto.com', 'depositphotos.com',
+];
     /** Longueur minimale pour qu'une page soit exploitable. */
     private const MIN_LENGTH = 500;
 

@@ -24,11 +24,17 @@ class HeroExtractor implements Agent, HasStructuredOutput
 {
     use Promptable;
 
+    /** Doit rester aligne sur les slugs du CategorySeeder. */
     private const CATEGORIES = [
         'football', 'athletisme', 'boxe', 'basketball', 'arts-martiaux',
         'litterature', 'musique', 'cinema', 'arts-visuels',
         'resistance', 'dynasties', 'exploration',
         'sciences', 'spiritualite', 'education',
+    ];
+
+    /** Doit rester aligne sur la contrainte de la table achievements. */
+    private const ACHIEVEMENT_TYPES = [
+        'award', 'title', 'record', 'publication', 'work', 'other',
     ];
 
     public function instructions(): Stringable|string
@@ -88,7 +94,7 @@ class HeroExtractor implements Agent, HasStructuredOutput
                     'year' => $schema->integer()->nullable()->required(),
 
                     'type' => $schema->string()
-                        ->enum(['title', 'medal', 'record', 'award', 'oeuvre', 'other'])
+                        ->enum(self::ACHIEVEMENT_TYPES)
                         ->required(),
 
                     'title' => $schema->object([
