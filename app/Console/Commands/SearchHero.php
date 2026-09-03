@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Models\Hero;
 use App\Ai\Agents\HeroExtractor;
 use App\Services\ContentCleaner;
 use App\Services\HeroPersister;
@@ -24,8 +25,9 @@ use Throwable;
 class SearchHero extends Command
 {
     protected $signature = 'hero:search
-                            {name : Nom de la figure a rechercher}
-                            {--context= : Precision ajoutee a la requete web}';
+                        {name : Nom de la figure a rechercher}
+                        {--context= : Precision ajoutee a la requete web}
+                        {--force : Relance l\'extraction meme si la fiche existe}';
 
     protected $description = 'Recherche une figure marocaine et cree une fiche en brouillon';
 
@@ -40,6 +42,17 @@ class SearchHero extends Command
         $name  = $this->argument('name');
         $query = trim($name.' '.($this->option('context') ?? 'personnalite marocaine'));
 
+        $existing = Hero::whereHas('translations', fn ($q) => $q->where('name', 'like', "%{$name}%"))
+    ->with('translations')
+    ->first();
+
+if ($existing && ! $this->option('force')) {
+    $this->components->warn("Fiche deja presente : {$existing->slug} ({$existing->status})");
+    $this->components->info('Utilisez --force pour relancer l\'extraction.');
+
+    return self::SUCCESS;
+}
+        
         try {
             $pages = null;
 
