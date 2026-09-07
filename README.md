@@ -187,7 +187,7 @@ non validée ne peut pas répondre, même si le prompt est contourné.
 
 - [x] **Sprint 1** — Schéma de données, models, seeders, socle multilingue
 - [x] **Sprint 2** — Configuration multilingue, tamazight, switcher de langue
-- [ ] **Sprint 3** — Commande `hero:search` : recherche web, extraction, persistance
+- [x] **Sprint 3** — Commande `hero:search` : recherche web, extraction, persistance
 - [ ] **Sprint 4** — Événement `HeroNotFound` et file des demandes
 - [ ] **Sprint 5** — Espace administrateur : demandes, brouillons, édition, publication
 - [ ] **Sprint 6** — Front public : recherche, fiche héros, i18n de l'interface, RTL
