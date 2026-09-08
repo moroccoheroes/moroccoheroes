@@ -16,40 +16,48 @@ class WebSearchService
     'instagram.com', 'facebook.com', 'x.com', 'twitter.com',
     'tiktok.com', 'pinterest.com', 'linkedin.com',
 
-    // banques d'images : beaucoup de texte, aucune information
+    // banques d'images
     'gettyimages.com', 'shutterstock.com', 'alamy.com',
     'istockphoto.com', 'depositphotos.com',
+
+    // dictionnaires, citations, forums, miroirs de Wikipedia
+    'thefreedictionary.com', 'azquotes.com', 'brainyquote.com',
+    'kiddle.co', 'dbpedia.org', '/forum',
 ];
     /** Longueur minimale pour qu'une page soit exploitable. */
-    private const MIN_LENGTH = 500;
+    private const MIN_LENGTH = 300;
 
     /**
      * Cherche sur le web et renvoie les pages utilisables.
      *
      * @return Collection<int, array{url: string, title: string, content: string}>
      */
-    public function search(string $query, int $maxResults = 5): Collection
-    {
-        $response = Http::withToken(config('services.tavily.key'))
-            ->timeout(30)
-            ->post('https://api.tavily.com/search', [
-                'query'               => $query,
-                'max_results'         => $maxResults,
-                'include_raw_content' => true,
-            ]);
+   public function search(string $query, int $maxResults = 5): Collection
+{
+    $response = Http::withToken(config('services.tavily.key'))
+        ->timeout(30)
+        ->post('https://api.tavily.com/search', [
+            'query'               => $query,
+            'max_results'         => $maxResults,
+            'include_raw_content' => true,
+        ]);
 
-        $response->throw();
+    $response->throw();
 
-        return collect($response->json('results'))
-            ->filter(fn (array $r) => strlen($r['raw_content'] ?? '') > self::MIN_LENGTH)
-            ->reject(fn (array $r) => $this->isBlocked($r['url']))
-            ->map(fn (array $r) => [
-                'url'     => $r['url'],
-                'title'   => $r['title'],
-                'content' => $r['raw_content'],
-            ])
-            ->values();
-    }
+    return collect($response->json('results'))
+        ->map(fn (array $r) => [
+            'url'     => $r['url'],
+            'title'   => $r['title'] ?? '',
+            // raw_content n'est pas toujours renvoye ; content est alors
+            // le seul texte disponible et suffit souvent.
+            'content' => filled($r['raw_content'] ?? null)
+                ? $r['raw_content']
+                : ($r['content'] ?? ''),
+        ])
+        ->filter(fn (array $r) => strlen($r['content']) > self::MIN_LENGTH)
+        ->reject(fn (array $r) => $this->isBlocked($r['url']))
+        ->values();
+}
 
     private function isBlocked(string $url): bool
     {

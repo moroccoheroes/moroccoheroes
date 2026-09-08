@@ -9,11 +9,16 @@ use Laravel\Ai\Promptable;
 use Stringable;
 
 /**
- * Extrait une fiche biographique a partir de pages web nettoyees.
+ * Extrait la fiche structuree d'une figure : identite, dates, palmares.
  *
  * Le schema garantit la forme de la reponse : plus besoin de decrire
  * le JSON dans le prompt ni d'esperer que le modele le respecte.
  * Les instructions ne portent donc que sur le fond.
+ *
+ * La biographie longue n'est pas demandee ici. Reclamer quatre langues,
+ * un palmares et plusieurs paragraphes dans une seule reponse revient a
+ * ce que le modele sacrifie le champ le plus couteux : la biographie
+ * ressortait systematiquement null. Elle est confiee a BiographyWriter.
  *
  * Note : en schema strict, required et nullable ne s'opposent pas.
  * required signifie que la cle doit etre presente, nullable que sa
@@ -51,7 +56,8 @@ class HeroExtractor implements Agent, HasStructuredOutput
         - Le champ zgh (tamazight) reste entierement null : la transcription des
           noms propres en tifinagh n'a pas de norme stable et sera saisie a la main.
         - N'inscris dans sources que les URL dont tu t'es reellement servi.
-        - Le resume fait deux ou trois phrases, factuelles, sans emphase.
+        - summary tient en deux ou trois phrases factuelles, sans emphase.
+          La biographie longue est redigee separement, ne la produis pas ici.
         TXT;
     }
 
@@ -117,7 +123,11 @@ class HeroExtractor implements Agent, HasStructuredOutput
             'name'        => $schema->string()->nullable()->required(),
             'nickname'    => $schema->string()->nullable()->required(),
             'birth_place' => $schema->string()->nullable()->required(),
-            'summary'     => $schema->string()->nullable()->required(),
+
+            'summary' => $schema->string()
+                ->description('Deux ou trois phrases.')
+                ->nullable()
+                ->required(),
         ])->required();
     }
 }
