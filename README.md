@@ -109,10 +109,10 @@ Chacun répond à un problème différent, découvert en testant.
 
 Le premier travaille sur le HTML brut : certains sites bloquent les robots et
 renvoient zéro caractère. Le deuxième mesure ce qui subsiste **après**
-nettoyage : une page de fédération pesait 16 000 caractères et n'était faite que
+nettoyage — une page de fédération pesait 16 000 caractères et n'était faite que
 d'images encodées ; une banque d'images en pesait 75 000 pour zéro information,
 et la fiche produite était vide. Le troisième restreint les sources citées à
-celles effectivement transmises — sur un site institutionnel, « d'où vient cette
+celles effectivement transmises : sur un site institutionnel, « d'où vient cette
 information » n'est pas un détail.
 
 ### Pourquoi deux agents
@@ -123,9 +123,10 @@ le plus coûteux : la biographie ressortait systématiquement `null`, quel que
 soit le modèle et quelles que soient les instructions.
 
 Séparer en deux appels donne à chacun une tâche et une seule. Le second reçoit
-un contexte volontairement plus court, et réessaie avec une attente croissante
-en cas de limitation de débit. Si la biographie échoue malgré tout, la commande
-avertit et continue : une fiche sans biographie reste exploitable.
+un contexte volontairement plus court et réessaie avec une attente croissante
+(0, 15, 30 secondes) en cas de limitation de débit — l'erreur réelle rencontrée
+était `rate limited by AI provider`. Si la biographie échoue malgré tout, la
+commande avertit et continue : une fiche sans biographie reste exploitable.
 
 ### Une source propre vaut mieux qu'une source volumineuse
 
@@ -133,6 +134,8 @@ Une page de fondation de 7 000 caractères a donné une meilleure extraction qu'
 article encyclopédique de 75 000, dont l'essentiel était constitué de tableaux
 et de références. Les domaines de référence sont donc interrogés en premier ;
 la recherche ne s'ouvre au reste du web que si elle ne trouve pas assez.
+
+Le même principe guidera le découpage en fragments pour la recherche sémantique.
 
 ---
 
@@ -158,7 +161,8 @@ essayer le français.
 Le tamazight s'écrit en tifinagh (`zgh`), de gauche à droite, police
 *Noto Sans Tifinagh*. L'extraction laisse volontairement ces champs vides : la
 transcription des noms propres en tifinagh n'a pas de norme stable et ne doit
-pas être devinée par un modèle. Elle est saisie à la main après validation.
+pas être devinée par un modèle. Elle est saisie à la main après validation
+terminologique.
 
 ---
 
@@ -182,10 +186,26 @@ pas être devinée par un modèle. Elle est saisie à la main après validation.
 ### Idempotence
 
 `hero:search` peut être relancée sur une fiche existante pour l'enrichir. Chaque
-méthode d'enregistrement gère la reprise à sa manière : `updateOrCreate` sur la
-locale pour les traductions, suppression puis recréation pour le palmarès,
-suppression sélective pour les sources — afin qu'une source déjà validée par un
-modérateur conserve son statut.
+méthode d'enregistrement gère la reprise à sa manière :
+
+| Table | Stratégie | Raison |
+|---|---|---|
+| `hero_translations` | `updateOrCreate` sur la locale | mise à jour en place |
+| `achievements` | suppression puis recréation | la liste change en entier |
+| `sources` | suppression sélective (`whereNotIn`) | une source déjà validée par un modérateur conserve son statut |
+
+Sans la troisième, les sources s'accumulaient d'une exécution à l'autre — sept
+entrées pour quatre pages réellement lues.
+
+### Alignement avec le schéma de l'agent
+
+Deux constantes de `HeroExtractor` doivent rester synchronisées avec la base :
+les slugs de catégorie (`CategorySeeder`) et les types de palmarès (contrainte
+de la table `achievements`). Un `enum` désaligné produit une violation de
+contrainte à l'insertion. Les deux portent un commentaire en ce sens.
+
+En contrepartie, l'`enum` garantit que `Category::where('slug', …)` trouve
+toujours : le modèle ne peut pas inventer une catégorie.
 
 ---
 
@@ -196,9 +216,9 @@ en dur, pas lu depuis la réponse du modèle. Chaque fiche cite ses sources, ave
 `is_verified = false` tant qu'un humain ne les a pas contrôlées.
 
 Les instructions imposent de ne rien inventer et de mettre `null` en cas de
-doute. Cette règle tient : sur une recherche dont les sources ne contenaient
-aucune information biographique, le modèle a renvoyé un palmarès vide plutôt que
-de le combler.
+doute. La règle tient : sur une recherche dont les sources ne contenaient aucune
+information biographique, le modèle a renvoyé un palmarès vide plutôt que de le
+combler.
 
 L'agent conversationnel est désactivé par défaut (`ai_chat_enabled = false`) et
 s'active fiche par fiche. Pour une personne vivante, `ai_chat_mode` reste
@@ -223,12 +243,21 @@ elle. La règle est portée par le schéma, pas seulement par le prompt.
 ## 8. Commandes utiles
 
 ```bash
+# Moteur
 php artisan hero:search "Nawal El Moutawakel" --context="athlete championne olympique"
+php artisan hero:search --help
+
+# Base
 php artisan migrate:fresh --seed
 php artisan db:seed --class=CategorySeeder
+
+# Quand une modification ne semble pas prise en compte
 php artisan optimize:clear
-php artisan tinker
+composer dump-autoload
+
+# Front
 npm run dev
+npm run build
 ```
 
 Vérifier le multilingue :
@@ -237,6 +266,17 @@ Vérifier le multilingue :
 $c = App\Models\Category::where('slug','sport')->with('translations')->first();
 app()->setLocale('zgh');
 $c->tr('name');   // ⴰⴷⴷⴰⵍ
+```
+
+Inspecter une fiche produite :
+
+```php
+$h = App\Models\Hero::where('slug','said-aouita')
+    ->with('translations','achievements','sources')->first();
+
+$h->translations->pluck('locale');                      // ar, en, fr — jamais zgh vide
+$h->achievements->map(fn($a) => [$a->year, $a->title['fr']]);
+$h->sources->pluck('url');
 ```
 
 ---
