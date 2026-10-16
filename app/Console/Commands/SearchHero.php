@@ -36,9 +36,7 @@ class SearchHero extends Command
 
     protected $description = 'Recherche une figure marocaine et cree une fiche en brouillon';
 
-    /** Longueur minimale d'une page nettoyee pour etre transmise au modele. */
-    private const MIN_USABLE_LENGTH = 400;
-
+    
     /** Pause entre les deux appels au modele, pour rester sous la limite de debit. */
     private const THROTTLE_SECONDS = 5;
 
@@ -47,6 +45,14 @@ class SearchHero extends Command
 
     /** Attentes successives en cas de limitation de debit, en secondes. */
     private const BIO_RETRY_DELAYS = [0, 15, 30];
+     /** Longueur minimale d'une page nettoyee pour etre transmise au modele. */
+    private const MIN_USABLE_LENGTH = 400;
+
+    /** Nombre de sources transmises au modele. Au-dela, on paie de la redondance. */
+    private const MAX_SOURCES = 4;
+
+    /** Plafond du contexte, en caracteres : les modeles ont une limite de jetons. */
+    private const MAX_CONTEXT_LENGTH = 18000;
 
     public function handle(
         WebSearchService $search,
@@ -91,12 +97,14 @@ class SearchHero extends Command
             }
             $this->line('');
 
-            $usable = $pages
+                        $usable = $pages
                 ->map(fn (array $p) => [
                     'url'     => $p['url'],
                     'content' => $cleaner->clean($p['content']),
                 ])
                 ->filter(fn (array $p) => strlen($p['content']) > self::MIN_USABLE_LENGTH)
+                // Tavily classe deja par pertinence : les premieres suffisent.
+                ->take(self::MAX_SOURCES)
                 ->values();
 
             if ($usable->isEmpty()) {
@@ -113,8 +121,14 @@ class SearchHero extends Command
                 ->map(fn (array $p) => "SOURCE: {$p['url']}\n\n{$p['content']}")
                 ->implode("\n\n---\n\n");
 
-            $this->components->info('Contexte reduit a '.number_format(strlen($context)).' caracteres.');
+            // Dernier garde-fou avant l'appel : le modele refuse au-dela.
+            if (mb_strlen($context) > self::MAX_CONTEXT_LENGTH) {
+                $context = mb_substr($context, 0, self::MAX_CONTEXT_LENGTH);
 
+                $this->components->warn('Contexte tronque au plafond.');
+            }
+
+            $this->components->info('Contexte reduit a '.number_format(mb_strlen($context)).' caracteres.');
             $data = null;
 
             $this->components->task('Extraction', function () use ($name, $context, &$data) {
