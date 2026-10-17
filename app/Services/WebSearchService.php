@@ -84,8 +84,10 @@ class WebSearchService
             $payload['include_domains'] = $includeDomains;
         }
 
-        $response = Http::withToken(config('services.tavily.key'))
-            ->timeout(30)
+                $response = Http::withToken(config('services.tavily.key'))
+            ->connectTimeout(20)
+            ->timeout(45)
+            ->retry(3, 2000, throw: false)
             ->post('https://api.tavily.com/search', $payload);
 
         $response->throw();
