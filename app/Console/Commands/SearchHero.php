@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Ai\Agents\BiographyWriter;
 use App\Ai\Agents\HeroExtractor;
+use App\Models\SearchRequest;
 use App\Models\Hero;
 use App\Services\ContentCleaner;
 use App\Services\HeroPersister;
@@ -207,11 +208,14 @@ class SearchHero extends Command
 
             $hero = null;
 
-            $this->components->task('Enregistrement', function () use ($persister, $data, &$hero) {
+                        $this->components->task('Enregistrement', function () use ($persister, $data, &$hero) {
                 $hero = $persister->save($data);
 
                 return true;
             });
+
+            // La fiche existe : la demande qui l'a motivee peut sortir de la file.
+            $resolved = SearchRequest::resolveFor($name, $hero);
         } catch (Throwable $e) {
             $this->components->error($e->getMessage());
 
@@ -225,6 +229,13 @@ class SearchHero extends Command
         $this->components->twoColumnDetail('Biographie', $hero->tr('biography', 'fr') ? 'oui' : '—');
         $this->components->twoColumnDetail('Palmares', (string) $hero->achievements->count());
         $this->components->twoColumnDetail('Sources', (string) $hero->sources->count());
+        
+                if ($resolved !== null) {
+            $this->components->twoColumnDetail(
+                'Demande traitee',
+                "#{$resolved->id}  ({$resolved->hits_count} recherches)",
+            );
+        }
         $this->line('');
 
         return self::SUCCESS;

@@ -45,6 +45,32 @@ class SearchRequest extends Model
         return $request;
     }
 
+        /**
+     * Marque la demande correspondante comme traitee et la relie a la fiche.
+     *
+     * Le rapprochement passe par la cle normalisee : l'administrateur peut
+     * lancer la recherche avec une casse ou des accents differents de ce
+     * qu'avait tape le visiteur, les deux retombent sur la meme cle.
+     *
+     * Renvoie null quand aucune demande ne correspond : une fiche creee
+     * a l'initiative de l'administrateur n'a pas de demande derriere elle.
+     */
+    public static function resolveFor(string $query, Hero $hero): ?self
+    {
+        $request = static::where('normalized_query', static::normalize($query))->first();
+
+        if ($request === null) {
+            return null;
+        }
+
+        $request->update([
+            'status'  => 'resolved',
+            'hero_id' => $hero->id,
+        ]);
+
+        return $request;
+    }
+
     /**
      * Ramene une requete a sa forme de comparaison.
      *
