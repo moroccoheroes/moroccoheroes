@@ -12,29 +12,32 @@ use RuntimeException;
 use Throwable;
 
 /**
- * Conduit une recherche documentaire de bout en bout.
+ * Recherche documentaire sur une figure, de la requete web a la fiche.
  *
- * Toute la logique vit ici. La commande artisan et le job de file
- * d'attente ne sont que deux manieres de la declencher : le service
- * ignore laquelle l'appelle. Il rend compte de son avancement par un
- * closure optionnel, que l'appelant affiche, journalise, ou ignore.
+ * Le service ignore qui l'appelle : une commande qui dessine dans un
+ * terminal, un job qui tourne en file d'attente. Il se contente de
+ * signaler ou il en est a travers $onProgress, que l'appelant fournit
+ * ou non. Separer le travail de son compte rendu evite d'avoir deux
+ * copies du pipeline qui divergeront a la premiere correction.
+ *
+ * La verification « la fiche existe deja » reste en dehors : c'est une
+ * politique, pas du travail, et elle differe selon l'appelant.
  */
 class HeroResearchService
 {
-    private const SEARCH_RESULTS = 10;
-
     /** Longueur minimale d'une page nettoyee pour etre transmise au modele. */
     private const MIN_USABLE_LENGTH = 400;
 
-    /** Au-dela, on paie de la redondance plus que de l'information. */
+    /** Nombre de sources transmises au modele. Au-dela, on paie de la redondance. */
     private const MAX_SOURCES = 4;
 
-    /** Plafond du contexte : les modeles ont une limite de jetons. */
+    /** Plafond du contexte, en caracteres : les modeles ont une limite de jetons. */
     private const MAX_CONTEXT_LENGTH = 18000;
 
-    /** Pause entre les deux appels, pour rester sous la limite de debit. */
+    /** Pause entre les deux appels au modele, pour rester sous la limite de debit. */
     private const THROTTLE_SECONDS = 5;
 
+    /** Contexte transmis au redacteur de biographie, plus court que celui de l'extraction. */
     private const BIO_CONTEXT_LENGTH = 6000;
 
     /** Attentes successives en cas de limitation de debit, en secondes. */
@@ -46,136 +49,144 @@ class HeroResearchService
         private readonly HeroPersister $persister,
     ) {}
 
-    /** La fiche existe-t-elle deja, sous une orthographe proche ? */
-    public function findExisting(string $name): ?Hero
-    {
-        return Hero::whereHas('translations', fn ($q) => $q->where('name', 'like', "%{$name}%"))
-            ->with('translations')
-            ->first();
-    }
-
     /**
-     * @param  Closure(string, array): void|null  $onProgress
+     * @param  Closure(string, array):void|null  $onProgress
      *
      * @throws RuntimeException quand aucune source exploitable n'est trouvee
      */
     public function research(string $name, ?string $context = null, ?Closure $onProgress = null): Hero
     {
+        // Un rapporteur muet par defaut : le reste du service appelle
+        // sans se demander si l'appelant en voulait un.
+        $report = $onProgress ?? static fn (string $stage, array $data) => null;
+
         $query = trim($name.' '.($context ?? 'personnalite marocaine'));
 
-        // --- Recherche web ---
+        $pages = $this->fetchPages($query, $name, $report);
+        $usable = $this->keepUsable($pages, $report);
+        $contextText = $this->buildContext($usable, $report);
 
-        $startedAt = microtime(true);
-        $pages = $this->search->search($query, self::SEARCH_RESULTS, $name);
+        $data = $this->extract($name, $contextText, $report);
+        $data = $this->addBiography($data, $name, $contextText, $report);
 
-        $onProgress?->('search', [
-            'query'   => $query,
-            'seconds' => microtime(true) - $startedAt,
-            'pages'   => $pages,
+        // Le modele peut citer une source qui ne lui a pas ete transmise.
+        $data['sources'] = array_values(array_intersect(
+            $data['sources'] ?? [],
+            $usable->pluck('url')->all(),
+        ));
+
+        $hero = $this->persister->save($data);
+
+        $report('saved', ['hero' => $hero]);
+
+        $resolved = SearchRequest::resolveFor($name, $hero);
+
+        if ($resolved !== null) {
+            $report('resolved', ['request' => $resolved]);
+        }
+
+        return $hero;
+    }
+
+    private function fetchPages(string $query, string $name, Closure $report): Collection
+    {
+        $start = microtime(true);
+
+        $pages = $this->search->search($query, 10, $name);
+
+        $report('search', [
+            'query' => $query,
+            'ms' => $this->elapsed($start),
+            'pages' => $pages->map(fn (array $page) => [
+                'url' => $page['url'],
+                'length' => strlen($page['content']),
+            ])->all(),
         ]);
 
         if ($pages->isEmpty()) {
-            throw new RuntimeException("Aucune source exploitable pour « {$name} ».");
+            throw new RuntimeException('Aucune source exploitable.');
         }
 
-        // --- Nettoyage et second filtrage ---
+        return $pages;
+    }
 
+    private function keepUsable(Collection $pages, Closure $report): Collection
+    {
         $usable = $pages
             ->map(fn (array $page) => [
-                'url'     => $page['url'],
+                'url' => $page['url'],
                 'content' => $this->cleaner->clean($page['content']),
             ])
             ->filter(fn (array $page) => strlen($page['content']) > self::MIN_USABLE_LENGTH)
             ->take(self::MAX_SOURCES)
             ->values();
 
+        $report('filtered', [
+            'used' => $usable->count(),
+            'found' => $pages->count(),
+        ]);
+
         if ($usable->isEmpty()) {
-            throw new RuntimeException("Aucune source ne contient de texte exploitable pour « {$name} ».");
+            throw new RuntimeException('Aucune source ne contient de texte exploitable.');
         }
 
-        $prompt = $usable
+        return $usable;
+    }
+
+    private function buildContext(Collection $usable, Closure $report): string
+    {
+        $context = $usable
             ->map(fn (array $page) => "SOURCE: {$page['url']}\n\n{$page['content']}")
             ->implode("\n\n---\n\n");
 
-        $truncated = mb_strlen($prompt) > self::MAX_CONTEXT_LENGTH;
+        $truncated = mb_strlen($context) > self::MAX_CONTEXT_LENGTH;
 
         if ($truncated) {
-            $prompt = mb_substr($prompt, 0, self::MAX_CONTEXT_LENGTH);
+            $context = mb_substr($context, 0, self::MAX_CONTEXT_LENGTH);
         }
 
-        $onProgress?->('context', [
-            'found'     => $pages->count(),
-            'used'      => $usable->count(),
-            'length'    => mb_strlen($prompt),
+        $report('context', [
+            'length' => mb_strlen($context),
             'truncated' => $truncated,
         ]);
 
-        // --- Extraction de la fiche ---
+        return $context;
+    }
 
-        $startedAt = microtime(true);
-        $data = (new HeroExtractor)->prompt(
-            "FIGURE RECHERCHEE : {$name}\n\nSOURCES :\n\n{$prompt}"
-        )->structured;
+    private function extract(string $name, string $context, Closure $report): array
+    {
+        $start = microtime(true);
+
+        $response = (new HeroExtractor)->prompt(
+            "FIGURE RECHERCHEE : {$name}\n\nSOURCES :\n\n{$context}"
+        );
+
+        // Le SDK decode lui-meme la reponse quand un schema est defini.
+        $data = $response->structured;
 
         if (! is_array($data)) {
             throw new RuntimeException('Reponse du modele illisible.');
         }
 
-        $onProgress?->('extraction', ['seconds' => microtime(true) - $startedAt]);
+        $report('extracted', ['ms' => $this->elapsed($start)]);
 
-        // --- Biographie, appel separe ---
+        return $data;
+    }
 
+    /**
+     * Une fiche sans biographie reste exploitable : l'echec est signale,
+     * il n'interrompt pas la recherche.
+     */
+    private function addBiography(array $data, string $name, string $context, Closure $report): array
+    {
         // L'extraction vient de consommer plusieurs milliers de jetons ;
         // enchainer immediatement declenche la limite de debit.
         sleep(self::THROTTLE_SECONDS);
 
-        $startedAt = microtime(true);
+        $start = microtime(true);
+        $bioContext = mb_substr($context, 0, self::BIO_CONTEXT_LENGTH);
+        $bio = null;
         $error = null;
-        $bio = $this->writeBiography($name, $prompt, $error);
-
-        foreach (['fr', 'ar', 'en'] as $locale) {
-            if (filled($bio[$locale] ?? null)) {
-                $data['translations'][$locale]['biography'] = $bio[$locale];
-            }
-        }
-
-        $onProgress?->('biography', [
-            'seconds' => microtime(true) - $startedAt,
-            'written' => filled($bio['fr'] ?? null),
-            'error'   => $error,
-        ]);
-
-        // --- Sources reellement transmises ---
-
-        $data['sources'] = array_values(array_intersect(
-            $data['sources'] ?? [],
-            $usable->pluck('url')->all(),
-        ));
-
-        // --- Enregistrement ---
-
-        $hero = $this->persister->save($data);
-
-        $onProgress?->('saved', ['hero' => $hero]);
-
-        // --- Fermeture de la demande, s'il y en avait une ---
-
-        $resolved = SearchRequest::resolveFor($name, $hero);
-
-        $onProgress?->('resolved', ['request' => $resolved]);
-
-        return $hero;
-    }
-
-    /**
-     * Redige la biographie, en reessayant quand le fournisseur limite le debit.
-     *
-     * Une biographie manquante ne fait pas echouer la recherche : la fiche
-     * reste exploitable sans elle, et le moderateur pourra la relancer.
-     */
-    private function writeBiography(string $name, string $context, ?string &$error): array
-    {
-        $shortContext = mb_substr($context, 0, self::BIO_CONTEXT_LENGTH);
 
         foreach (self::BIO_RETRY_DELAYS as $wait) {
             if ($wait > 0) {
@@ -183,23 +194,42 @@ class HeroResearchService
             }
 
             try {
-                $bio = (new BiographyWriter)->prompt(
-                    "FIGURE : {$name}\n\nSOURCES :\n\n{$shortContext}"
-                )->structured;
+                $response = (new BiographyWriter)->prompt(
+                    "FIGURE : {$name}\n\nSOURCES :\n\n{$bioContext}"
+                );
+
+                $bio = $response->structured;
 
                 if (is_array($bio) && filled($bio['fr'] ?? null)) {
-                    return $bio;
+                    break;
                 }
             } catch (Throwable $e) {
                 $error = $e->getMessage();
 
                 // Reessayer n'a de sens que sur une limitation de debit.
                 if (! str_contains(strtolower($e->getMessage()), 'rate limit')) {
-                    return [];
+                    break;
                 }
             }
         }
 
-        return [];
+        foreach (['fr', 'ar', 'en'] as $locale) {
+            if (filled($bio[$locale] ?? null)) {
+                $data['translations'][$locale]['biography'] = $bio[$locale];
+            }
+        }
+
+        $report('biography', [
+            'ok' => filled($bio['fr'] ?? null),
+            'ms' => $this->elapsed($start),
+            'error' => $error,
+        ]);
+
+        return $data;
+    }
+
+    private function elapsed(float $start): int
+    {
+        return (int) round((microtime(true) - $start) * 1000);
     }
 }

@@ -2,31 +2,21 @@
 
 namespace App\Console\Commands;
 
-use App\Ai\Agents\BiographyWriter;
-use App\Ai\Agents\HeroExtractor;
-use App\Models\SearchRequest;
 use App\Models\Hero;
-use App\Services\ContentCleaner;
-use App\Services\HeroPersister;
-use App\Services\WebSearchService;
+use App\Models\SearchRequest;
+use App\Services\HeroResearchService;
 use Illuminate\Console\Command;
 use Throwable;
 
 /**
- * Recherche une figure sur le web et en cree une fiche en brouillon.
+ * Lance une recherche documentaire depuis le terminal.
  *
- * Cette commande n'est jamais declenchee par un visiteur : elle est
- * lancee par un administrateur, depuis le terminal ou depuis son
- * espace, pour repondre a une demande restee sans resultat.
+ * La commande ne fait plus le travail : elle le confie a
+ * HeroResearchService et se charge de l'afficher. Le job de la file
+ * d'attente appellera le meme service avec un autre rapporteur.
  *
- * Le filtrage se fait en deux temps. WebSearchService ecarte les pages
- * vides et les domaines non recevables sur le HTML brut ; ici, apres
- * nettoyage, on ecarte celles dont il ne reste rien d'exploitable.
- * Une page peut peser 16 000 caracteres et n'etre faite que d'images.
- *
- * L'extraction se fait en deux appels : la fiche structuree d'un cote,
- * la biographie longue de l'autre. Tout demander en une fois conduit le
- * modele a sacrifier le champ le plus couteux.
+ * Ce qui reste ici releve de la politique du terminal : refuser de
+ * recommencer sans --force, et rendre compte a l'ecran.
  */
 class SearchHero extends Command
 {
@@ -37,34 +27,11 @@ class SearchHero extends Command
 
     protected $description = 'Recherche une figure marocaine et cree une fiche en brouillon';
 
-    
-    /** Pause entre les deux appels au modele, pour rester sous la limite de debit. */
-    private const THROTTLE_SECONDS = 5;
-
-    /** Contexte transmis au redacteur de biographie, plus court que celui de l'extraction. */
-    private const BIO_CONTEXT_LENGTH = 6000;
-
-    /** Attentes successives en cas de limitation de debit, en secondes. */
-    private const BIO_RETRY_DELAYS = [0, 15, 30];
-     /** Longueur minimale d'une page nettoyee pour etre transmise au modele. */
-    private const MIN_USABLE_LENGTH = 400;
-
-    /** Nombre de sources transmises au modele. Au-dela, on paie de la redondance. */
-    private const MAX_SOURCES = 4;
-
-    /** Plafond du contexte, en caracteres : les modeles ont une limite de jetons. */
-    private const MAX_CONTEXT_LENGTH = 18000;
-
-    public function handle(
-        WebSearchService $search,
-        ContentCleaner $cleaner,
-        HeroPersister $persister,
-    ): int {
-        $name  = $this->argument('name');
-        $query = trim($name.' '.($this->option('context') ?? 'personnalite marocaine'));
+    public function handle(HeroResearchService $research): int
+    {
+        $name = $this->argument('name');
 
         $existing = Hero::whereHas('translations', fn ($q) => $q->where('name', 'like', "%{$name}%"))
-            ->with('translations')
             ->first();
 
         if ($existing && ! $this->option('force')) {
@@ -74,154 +41,93 @@ class SearchHero extends Command
             return self::SUCCESS;
         }
 
+        $resolved = null;
+
         try {
-            $pages = null;
-
-            $this->components->task("Recherche web : {$query}", function () use ($search, $query, &$pages) {
-                $pages = $search->search($query, 10);
-
-                return $pages->isNotEmpty();
-            });
-
-            if ($pages->isEmpty()) {
-                $this->components->error('Aucune source exploitable.');
-
-                return self::FAILURE;
-            }
-
-            $this->line('');
-            foreach ($pages as $page) {
-                $this->components->twoColumnDetail(
-                    parse_url($page['url'], PHP_URL_HOST),
-                    number_format(strlen($page['content'])).' car.',
-                );
-            }
-            $this->line('');
-
-                        $usable = $pages
-                ->map(fn (array $p) => [
-                    'url'     => $p['url'],
-                    'content' => $cleaner->clean($p['content']),
-                ])
-                ->filter(fn (array $p) => strlen($p['content']) > self::MIN_USABLE_LENGTH)
-                // Tavily classe deja par pertinence : les premieres suffisent.
-                ->take(self::MAX_SOURCES)
-                ->values();
-
-            if ($usable->isEmpty()) {
-                $this->components->error('Aucune source ne contient de texte exploitable.');
-
-                return self::FAILURE;
-            }
-
-            $this->components->info(
-                $usable->count().' source(s) retenue(s) sur '.$pages->count().'.'
+            $hero = $research->research(
+                $name,
+                $this->option('context'),
+                $this->reporter($resolved),
             );
-
-            $context = $usable
-                ->map(fn (array $p) => "SOURCE: {$p['url']}\n\n{$p['content']}")
-                ->implode("\n\n---\n\n");
-
-            // Dernier garde-fou avant l'appel : le modele refuse au-dela.
-            if (mb_strlen($context) > self::MAX_CONTEXT_LENGTH) {
-                $context = mb_substr($context, 0, self::MAX_CONTEXT_LENGTH);
-
-                $this->components->warn('Contexte tronque au plafond.');
-            }
-
-            $this->components->info('Contexte reduit a '.number_format(mb_strlen($context)).' caracteres.');
-            $data = null;
-
-            $this->components->task('Extraction', function () use ($name, $context, &$data) {
-                $response = (new HeroExtractor)->prompt(
-                    "FIGURE RECHERCHEE : {$name}\n\nSOURCES :\n\n{$context}"
-                );
-
-                // Le SDK decode lui-meme la reponse quand un schema est defini.
-                $data = $response->structured;
-
-                return is_array($data);
-            });
-
-            if (! is_array($data)) {
-                $this->components->error('Reponse du modele illisible.');
-
-                return self::FAILURE;
-            }
-
-            // L'extraction vient de consommer plusieurs milliers de tokens ;
-            // enchainer immediatement declenche la limite de debit du fournisseur.
-            sleep(self::THROTTLE_SECONDS);
-
-            $bio      = null;
-            $bioError = null;
-
-            $this->components->task('Biographie', function () use ($name, $context, &$bio, &$bioError) {
-                // Le contexte complet n'est pas necessaire ici : la biographie
-                // se redige a partir du recit, pas du palmares detaille.
-                $bioContext = mb_substr($context, 0, self::BIO_CONTEXT_LENGTH);
-
-                foreach (self::BIO_RETRY_DELAYS as $wait) {
-                    if ($wait > 0) {
-                        sleep($wait);
-                    }
-
-                    try {
-                        $response = (new BiographyWriter)->prompt(
-                            "FIGURE : {$name}\n\nSOURCES :\n\n{$bioContext}"
-                        );
-
-                        $bio = $response->structured;
-
-                        if (is_array($bio) && filled($bio['fr'] ?? null)) {
-                            return true;
-                        }
-                    } catch (Throwable $e) {
-                        $bioError = $e->getMessage();
-
-                        // Reessayer n'a de sens que sur une limitation de debit.
-                        if (! str_contains(strtolower($e->getMessage()), 'rate limit')) {
-                            return false;
-                        }
-                    }
-                }
-
-                return false;
-            });
-
-            // Une fiche sans biographie reste exploitable : on previent, on continue.
-            if ($bioError !== null && blank($bio['fr'] ?? null)) {
-                $this->components->warn('Biographie non generee : '.mb_substr($bioError, 0, 200));
-            }
-
-            foreach (['fr', 'ar', 'en'] as $locale) {
-                if (filled($bio[$locale] ?? null)) {
-                    $data['translations'][$locale]['biography'] = $bio[$locale];
-                }
-            }
-
-            // Le modele peut citer une source qui ne lui a pas ete transmise.
-            $data['sources'] = array_values(array_intersect(
-                $data['sources'] ?? [],
-                $usable->pluck('url')->all(),
-            ));
-
-            $hero = null;
-
-                        $this->components->task('Enregistrement', function () use ($persister, $data, &$hero) {
-                $hero = $persister->save($data);
-
-                return true;
-            });
-
-            // La fiche existe : la demande qui l'a motivee peut sortir de la file.
-            $resolved = SearchRequest::resolveFor($name, $hero);
         } catch (Throwable $e) {
             $this->components->error($e->getMessage());
 
             return self::FAILURE;
         }
 
+        $this->summary($hero, $resolved);
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * Traduit les etapes du service en lignes de terminal.
+     *
+     * @param  SearchRequest|null  $resolved  rempli par reference, lu ensuite par summary()
+     */
+    private function reporter(?SearchRequest &$resolved): callable
+    {
+        return function (string $stage, array $data) use (&$resolved): void {
+            match ($stage) {
+                'search' => $this->reportSearch($data),
+                'filtered' => $this->components->info(
+                    "{$data['used']} source(s) retenue(s) sur {$data['found']}."
+                ),
+                'context' => $this->reportContext($data),
+                'extracted' => $this->components->twoColumnDetail(
+                    'Extraction', $this->seconds($data['ms'])
+                ),
+                'biography' => $this->reportBiography($data),
+                'resolved' => $resolved = $data['request'],
+                default => null,
+            };
+        };
+    }
+
+    private function reportSearch(array $data): void
+    {
+        $this->line('');
+        $this->components->twoColumnDetail(
+            "Recherche : {$data['query']}",
+            $this->seconds($data['ms']),
+        );
+        $this->line('');
+
+        foreach ($data['pages'] as $page) {
+            $this->components->twoColumnDetail(
+                parse_url($page['url'], PHP_URL_HOST),
+                number_format($page['length']).' car.',
+            );
+        }
+
+        $this->line('');
+    }
+
+    private function reportContext(array $data): void
+    {
+        if ($data['truncated']) {
+            $this->components->warn('Contexte tronque au plafond.');
+        }
+
+        $this->components->info(
+            'Contexte reduit a '.number_format($data['length']).' caracteres.'
+        );
+    }
+
+    private function reportBiography(array $data): void
+    {
+        $this->components->twoColumnDetail(
+            'Biographie',
+            $data['ok'] ? $this->seconds($data['ms']) : '<fg=yellow>echec</>',
+        );
+
+        if (! $data['ok'] && $data['error'] !== null) {
+            $this->components->warn(mb_substr($data['error'], 0, 200));
+        }
+    }
+
+    private function summary(Hero $hero, ?SearchRequest $resolved): void
+    {
         $this->line('');
         $this->components->twoColumnDetail('<fg=green>Fiche creee</>', $hero->slug);
         $this->components->twoColumnDetail('Statut', $hero->status);
@@ -229,15 +135,21 @@ class SearchHero extends Command
         $this->components->twoColumnDetail('Biographie', $hero->tr('biography', 'fr') ? 'oui' : '—');
         $this->components->twoColumnDetail('Palmares', (string) $hero->achievements->count());
         $this->components->twoColumnDetail('Sources', (string) $hero->sources->count());
-        
-                if ($resolved !== null) {
+
+        if ($resolved !== null) {
             $this->components->twoColumnDetail(
                 'Demande traitee',
                 "#{$resolved->id}  ({$resolved->hits_count} recherches)",
             );
         }
-        $this->line('');
 
-        return self::SUCCESS;
+        $this->line('');
+    }
+
+    private function seconds(int $ms): string
+    {
+        return $ms < 1000
+            ? $ms.' ms'
+            : round($ms / 1000, 1).' s';
     }
 }
